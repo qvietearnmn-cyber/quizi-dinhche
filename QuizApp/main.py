@@ -233,6 +233,20 @@ def main():
             "explanation": q["explanation"].strip() if q["explanation"] else ""
         })
         
+    # Manual overrides for parsed errors
+    overrides = {
+        # Chapter 1, PDF Question 45 (which is parsed with ID 46)
+        46: {
+            "answer": "D",
+            "explanation": "Thị trường tài chính mà điều chỉnh dòng vốn ngắn hạn \nvới thời gian đáo hạn ít hơn 1 năm gọi là\nThị trường tiền tệ"
+        }
+    }
+    for q in output_data:
+        if q["id"] in overrides:
+            for key, val in overrides[q["id"]].items():
+                q[key] = val
+
+        
     # Step 4: Write to questions.json
     output_json_path = os.path.join(base_dir, "questions.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
