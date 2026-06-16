@@ -62,27 +62,13 @@ def main():
     
     questions = []
     vietnamese_by_page = {}
-    bold_spans_by_page = {}
     
-    print("Step 1: Scanning metadata (bold fonts and Vietnamese blocks) page by page...")
+    print("Step 1: Scanning metadata (Vietnamese translation blocks) page by page...")
     for page_idx in range(len(doc)):
         page_num = page_idx + 1
         page = doc[page_idx]
         
-        # 1. Collect bold spans
-        bold_spans = set()
-        blocks_dict = page.get_text("dict")["blocks"]
-        for block in blocks_dict:
-            if "lines" in block:
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        font = span["font"].lower()
-                        text = span["text"].strip()
-                        if text and any(b in font for b in ["bold", "black", "heavy"]):
-                            bold_spans.add(normalize_text(text))
-        bold_spans_by_page[page_num] = bold_spans
-        
-        # 2. Collect Vietnamese translation blocks
+        # Collect Vietnamese translation blocks
         viet_blocks = []
         blocks = page.get_text("blocks")
         for b in blocks:
@@ -97,41 +83,44 @@ def main():
                 viet_blocks.append((y_mid, text))
         vietnamese_by_page[page_num] = viet_blocks
 
-    print("Step 2: Parsing English questions and options line by line...")
+    print("Step 2: Parsing English questions and options page by page using font dict...")
     current_q = None
     current_opt = None
     
     for page_idx in range(len(doc)):
         page_num = page_idx + 1
         page = doc[page_idx]
-        blocks = page.get_text("blocks")
+        blocks_dict = page.get_text("dict")["blocks"]
         
-        for b in blocks:
-            x0, y0, x1, y1, text, block_no, block_type = b
-            text = text.strip()
-            if not text:
-                continue
-            if is_vietnamese(text):
+        for block in blocks_dict:
+            if "lines" not in block:
                 continue
                 
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            for line in lines:
-                if "Cengage Learning" in line or "All Rights Reserved" in line:
+            for line in block["lines"]:
+                line_text = "".join(span["text"] for span in line["spans"]).strip()
+                if not line_text:
                     continue
-                if "intended for use outside" in line or "publicly accessible website" in line:
+                if is_vietnamese(line_text):
                     continue
-                if "U.S. Edition" in line or "scanned, copied" in line:
+                if "Cengage Learning" in line_text or "All Rights Reserved" in line_text:
                     continue
-                if re.search(r"^Chapter\s+\d+", line, re.IGNORECASE):
+                if "intended for use outside" in line_text or "publicly accessible website" in line_text:
                     continue
-                if "Financial Markets and Institutions" in line or "Determination of Interest Rates" in line:
+                if "U.S. Edition" in line_text or "scanned, copied" in line_text:
                     continue
-                if "Structure of Interest Rates" in line or "Money Markets" in line:
+                if re.search(r"^Chapter\s+\d+", line_text, re.IGNORECASE):
                     continue
-                if "\uf076" in line:
+                if "Financial Markets and Institutions" in line_text or "Determination of Interest Rates" in line_text:
+                    continue
+                if "Structure of Interest Rates" in line_text or "Money Markets" in line_text:
+                    continue
+                if "\uf076" in line_text:
                     continue
                 
-                q_match = re.match(r"^(\d+)\.(?:\s+(.*))?$", line)
+                # Check if spans of this line contain bold fonts
+                is_bold = any(any(b in span["font"].lower() for b in ["bold", "black", "heavy"]) for span in line["spans"] if span["text"].strip())
+                
+                q_match = re.match(r"^(\d+)\.(?:\s+(.*))?$", line_text)
                 if q_match:
                     if current_q:
                         questions.append(current_q)
@@ -143,18 +132,20 @@ def main():
                         "answer": None,
                         "explanation": "",
                         "page": page_num,
-                        "y": (y0 + y1) / 2
+                        "y": line["bbox"][1]  # Top coordinate of the line
                     }
                     current_opt = None
                     continue
                 
-                opt_match = re.match(r"^([A-E])\)\s*(.*)$", line)
+                opt_match = re.match(r"^([A-E])\)\s*(.*)$", line_text)
                 if opt_match and current_q:
                     current_opt = opt_match.group(1)
                     current_q["raw_options"][current_opt] = opt_match.group(2) or ""
+                    if is_bold:
+                        current_q["answer"] = current_opt
                     continue
                     
-                tf_match = re.search(r"([])\s*(True|False)", line, re.IGNORECASE)
+                tf_match = re.search(r"([])\s*(True|False)", line_text, re.IGNORECASE)
                 if tf_match and current_q:
                     val = tf_match.group(2).strip()
                     current_q["options"] = ["A) True", "B) False"]
@@ -162,16 +153,18 @@ def main():
                     current_opt = None
                     continue
                     
-                ans_match = re.match(r"^ANSWER:\s*([A-E])", line, re.IGNORECASE)
+                ans_match = re.match(r"^ANSWER:\s*([A-E])", line_text, re.IGNORECASE)
                 if ans_match and current_q:
                     current_q["answer"] = ans_match.group(1).upper()
                     current_opt = None
                     continue
                     
                 if current_opt and current_q:
-                    current_q["raw_options"][current_opt] += " " + line
+                    current_q["raw_options"][current_opt] += " " + line_text
+                    if is_bold:
+                        current_q["answer"] = current_opt
                 elif current_q and not current_q["raw_options"] and current_q["answer"] is None:
-                    current_q["question"] += " " + line
+                    current_q["question"] += " " + line_text
 
     if current_q:
         questions.append(current_q)
@@ -185,22 +178,7 @@ def main():
             sorted_keys = sorted(raw.keys())
             q["options"] = [f"{k}) {raw[k].strip()}" for k in sorted_keys]
             
-            if q["answer"] is None:
-                bold_spans = bold_spans_by_page.get(q["page"], set()).copy()
-                if q["page"] + 1 in bold_spans_by_page:
-                    bold_spans.update(bold_spans_by_page[q["page"] + 1])
-                
-                for k in sorted_keys:
-                    opt_text = normalize_text(raw[k])
-                    for bs in bold_spans:
-                        if not bs:
-                            continue
-                        if (opt_text in bs and len(opt_text) > 3) or (bs in opt_text and len(bs) > 3):
-                            q["answer"] = k
-                            break
-                    if q["answer"] is not None:
-                        break
-                        
+            # True/False question fallback when it lists only a single line in PDF
             if len(q["options"]) == 1:
                 opt_str = q["options"][0].lower()
                 if "true" in opt_str:
