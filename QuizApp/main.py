@@ -2,6 +2,82 @@ import fitz
 import re
 import json
 import os
+import time
+import socket
+
+# Force requests/urllib3 to use IPv4 only to prevent broken IPv6 routing connection timeouts on Windows
+orig_getaddrinfo = socket.getaddrinfo
+socket.getaddrinfo = lambda host, port, family=0, type=0, proto=0, flags=0: orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+from deep_translator import GoogleTranslator
+
+# Initialize GoogleTranslator for English to Vietnamese
+translator = GoogleTranslator(source='en', target='vi')
+
+def translate_text(text, cache=None):
+    if not text or not text.strip():
+        return ""
+    text_clean = text.strip()
+    if cache and text_clean in cache:
+        return cache[text_clean]
+        
+    for attempt in range(3):
+        try:
+            translated = translator.translate(text_clean)
+            if translated:
+                time.sleep(0.05) # small delay to prevent rate limits
+                return translated
+        except Exception as e:
+            print(f"Translation error (attempt {attempt+1}/3) for '{text_clean[:35]}...': {e}")
+            time.sleep(1.0)
+    return text_clean # Fallback
+
+def translate_question_and_options(q_text, options, cache=None):
+    q_text_clean = q_text.strip()
+    if cache and q_text_clean in cache:
+        return cache[q_text_clean]
+        
+    # Parse prefixes and bodies of options
+    parsed_options = []
+    option_prefixes = []
+    for opt in options:
+        opt_match = re.match(r"^([A-E]\)\s*)(.*)$", opt)
+        if opt_match:
+            option_prefixes.append(opt_match.group(1))
+            parsed_options.append(opt_match.group(2).strip())
+        else:
+            option_prefixes.append("")
+            parsed_options.append(opt.strip())
+            
+    # Try combined translation
+    separator = " ||| "
+    joined_text = q_text_clean + separator + separator.join(parsed_options)
+    
+    for attempt in range(3):
+        try:
+            translated_joined = translator.translate(joined_text)
+            if translated_joined:
+                parts = [p.strip() for p in translated_joined.split("|||")]
+                if len(parts) == 1 + len(options):
+                    trans_q = parts[0]
+                    trans_opts = []
+                    for prefix, opt_body in zip(option_prefixes, parts[1:]):
+                        trans_opts.append(f"{prefix}{opt_body}")
+                    time.sleep(0.05)
+                    return trans_q, trans_opts
+                else:
+                    print(f"Warning: split parts count mismatch ({len(parts)} vs {1 + len(options)}), falling back to individual translation.")
+        except Exception as e:
+            print(f"Translation error (attempt {attempt+1}/3) for joined text: {e}")
+            time.sleep(1.0)
+            
+    # Fallback to individual translations
+    print("Falling back to translating elements one by one...")
+    trans_q = translate_text(q_text_clean)
+    trans_opts = []
+    for prefix, opt_body in zip(option_prefixes, parsed_options):
+        trans_opts.append(f"{prefix}{translate_text(opt_body)}")
+    return trans_q, trans_opts
 
 def is_vietnamese(text):
     """
@@ -52,7 +128,9 @@ def get_chapter_number(page_num):
 
 def main():
     base_dir = os.path.dirname(__file__)
-    pdf_path = os.path.join(base_dir, "Test Bank - 2.pdf")
+    pdf_path = os.path.join(base_dir, "Test Bank - 2_2.pdf")
+    if not os.path.exists(pdf_path):
+        pdf_path = os.path.join(base_dir, "Test Bank - 2.pdf")
     if not os.path.exists(pdf_path):
         print(f"Error: PDF file not found at {pdf_path}")
         return
@@ -199,19 +277,42 @@ def main():
             if mapped_blocks:
                 q["explanation"] = "\n".join(mapped_blocks)
 
+    # Load existing translation cache if possible
+    translation_cache = {}
+    output_json_path = os.path.join(base_dir, "questions.json")
+    if os.path.exists(output_json_path):
+        try:
+            with open(output_json_path, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+                for q_obj in old_data:
+                    q_text = q_obj.get("question", "").strip()
+                    trans_q = q_obj.get("translated_question", "")
+                    trans_opts = q_obj.get("translated_options", [])
+                    if q_text and trans_q and trans_opts:
+                        translation_cache[q_text] = (trans_q, trans_opts)
+            print(f"Loaded {len(translation_cache)} translated questions from cache.")
+        except Exception as e:
+            print(f"Warning: Could not load translation cache: {e}")
+
     # Prepare output database list
+    # Prepare output database list with basic fields and caching
     output_data = []
+    total_q = len(questions)
     for q in questions:
+        q_text = q["question"].strip()
+        trans_q, trans_opts = translation_cache.get(q_text, (None, None))
         output_data.append({
             "id": q["id"],
             "chapter": get_chapter_number(q["page"]),
-            "question": q["question"].strip(),
+            "question": q_text,
             "options": q["options"],
             "answer": q["answer"],
-            "explanation": q["explanation"].strip() if q["explanation"] else ""
+            "explanation": q["explanation"].strip() if q["explanation"] else "",
+            "translated_question": trans_q,
+            "translated_options": trans_opts
         })
-        
-    # Manual overrides for parsed errors
+
+    # Manual overrides for parsed errors (applied early so they are saved correctly)
     overrides = {
         # Chapter 1, PDF Question 45 (which is parsed with ID 46)
         46: {
@@ -224,12 +325,28 @@ def main():
             for key, val in overrides[q["id"]].items():
                 q[key] = val
 
+    # Translate missing questions with incremental saving
+    print("Step 3.5: Translating questions and options...")
+    for idx, q in enumerate(output_data):
+        # Skip if already translated (e.g. loaded from cache)
+        if q["translated_question"] and q["translated_options"]:
+            continue
+            
+        print(f"Translating {idx+1}/{total_q}: {q['question'][:40]}...")
+        trans_q, trans_opts = translate_question_and_options(q["question"], q["options"])
+        q["translated_question"] = trans_q
+        q["translated_options"] = trans_opts
         
-    # Step 4: Write to questions.json
-    output_json_path = os.path.join(base_dir, "questions.json")
+        # Write incrementally every 10 questions to safeguard progress
+        if (idx + 1) % 10 == 0:
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(output_data, f, ensure_ascii=False, indent=2)
+            print(f"Incremental progress saved at question {idx+1}/{total_q}")
+
+    # Step 4: Write final database to questions.json
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=2)
-    print(f"Successfully wrote database to {output_json_path}")
+    print(f"Successfully wrote final database to {output_json_path}")
 
     # Step 5: Embed questions directly inside index.html JavaScript code via string slice markers
     index_html_path = os.path.join(base_dir, "index.html")
